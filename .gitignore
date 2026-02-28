@@ -1,0 +1,14 @@
+# Gmail OAuth credentials — never commit these
+credentials.json
+token.json
+
+# Environment files
+.env
+.env.*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/

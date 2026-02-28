@@ -1,0 +1,36 @@
+name: AI Email Assistant
+
+on:
+  schedule:
+    # Runs every hour — adjust cron to change frequency
+    # Examples:
+    #   Every 30 min:  '*/30 * * * *'
+    #   Every 2 hours: '0 */2 * * *'
+    #   Twice a day:   '0 9,17 * * *'
+    - cron: '0 * * * *'
+  workflow_dispatch:  # Allows manual trigger from GitHub Actions tab
+
+jobs:
+  check-emails:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run email agent
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GMAIL_TOKEN_JSON: ${{ secrets.GMAIL_TOKEN_JSON }}
+          CHECK_HOURS: '1'
+        run: python agent.py
