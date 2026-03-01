@@ -258,51 +258,6 @@ def compute_cognitive_load(results):
     return min(10, raw)
 
 
-def send_notification(service, user_email, action_items, summary, cognitive_score, drafted_count):
-    load_label = 'Low' if cognitive_score <= 3 else 'Medium' if cognitive_score <= 6 else 'High'
-
-    lines = [
-        f"Cognitive Load: {cognitive_score}/10 ({load_label})",
-        '',
-    ]
-
-    # Only show what needs attention
-    for cat in ('needs_reply', 'needs_action', 'delegate', 'waiting_for'):
-        items = [i for i in action_items if i['category'] == cat]
-        if not items:
-            continue
-        lines.append(f"--- {CATEGORIES[cat]} ({len(items)}) ---")
-        for item in items:
-            tag = item['urgency'].upper() if item['urgency'] == 'high' else item['urgency'].capitalize()
-            lines.append(f"  [{tag}] {item['from']}")
-            lines.append(f"    {item['subject']}")
-            lines.append(f"    {item['reason']}")
-            lines.append('')
-
-    if drafted_count > 0:
-        lines.append(f'{drafted_count} draft(s) ready: https://mail.google.com/mail/u/0/#drafts')
-        lines.append('')
-
-    # Quiet counts
-    quiet = {k: summary.get(k, 0) for k in ('read_later', 'newsletter', 'no_action') if summary.get(k, 0) > 0}
-    if quiet:
-        lines.append('Skipped: ' + ', '.join(f"{CATEGORIES[k]}: {v}" for k, v in quiet.items()))
-
-    lines.append(f"\n---\n{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
-
-    message = MIMEText('\n'.join(lines))
-    message['To'] = user_email
-    message['From'] = user_email
-    message['Subject'] = (
-        f"[AI Triage] Load {cognitive_score}/10 — "
-        f"{drafted_count} draft(s), "
-        f"{summary.get('needs_action', 0)} action(s)"
-    )
-
-    raw = base64.urlsafe_b64encode(message.as_bytes()).decode('utf-8')
-    service.users().messages().send(userId='me', body={'raw': raw}).execute()
-
-
 def main():
     api_key = os.environ.get('ANTHROPIC_API_KEY')
     if not api_key:
@@ -315,9 +270,7 @@ def main():
     client = anthropic.Anthropic(api_key=api_key)
     service = get_gmail_service()
 
-    profile = service.users().getProfile(userId='me').execute()
-    user_email = profile['emailAddress']
-    print(f'Checking emails for {user_email}...')
+    print('Checking emails...')
 
     hours = int(os.environ.get('CHECK_HOURS', '8'))
     emails = get_recent_emails(service, hours=hours)
@@ -370,11 +323,9 @@ def main():
             print('Warning: Failed to push briefing to Notion.')
 
     if emails:
-        send_notification(service, user_email, action_items, summary, cognitive_score, drafted_count)
         print(
             f'\nDone. Cognitive load: {cognitive_score}/10. '
-            f'{drafted_count} draft(s) created. '
-            f'Notification sent to {user_email}.'
+            f'{drafted_count} draft(s) created.'
         )
     else:
         print('\nDone. No new emails this run.')
