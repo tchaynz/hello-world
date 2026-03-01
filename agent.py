@@ -4,7 +4,6 @@ import base64
 import json
 import requests
 from email.mime.text import MIMEText
-from email.utils import parsedate_to_datetime
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
@@ -183,24 +182,45 @@ def create_draft(service, email, draft_text):
     return draft['id']
 
 
-def log_to_notion(token, database_id, email, category, reason, urgency, draft_gmail_url=None):
-    try:
-        dt = parsedate_to_datetime(email['date'])
-        date_iso = dt.astimezone(timezone.utc).isoformat()
-    except Exception:
-        date_iso = datetime.now(timezone.utc).isoformat()
+def push_briefing_to_notion(token, page_id, action_items, summary, cognitive_score, drafted_count):
+    """Create a single briefing page under a Notion parent page."""
+    load_label = 'Low' if cognitive_score <= 3 else 'Medium' if cognitive_score <= 6 else 'High'
+    now = datetime.now(timezone.utc)
+    title = f"Email Briefing — {now.strftime('%b %-d, %Y %H:%M UTC')}"
 
-    properties = {
-        'Subject':  {'title':     [{'text': {'content': email['subject'][:2000]}}]},
-        'From':     {'rich_text': [{'text': {'content': email['from'][:2000]}}]},
-        'Category': {'select':    {'name': CATEGORIES[category]}},
-        'Urgency':  {'select':    {'name': urgency.capitalize()}},
-        'Reason':   {'rich_text': [{'text': {'content': reason[:2000]}}]},
-        'Received': {'date':      {'start': date_iso}},
-    }
+    # Build page content blocks
+    children = [
+        _notion_heading(f"Cognitive Load: {cognitive_score}/10 ({load_label})"),
+    ]
 
-    if draft_gmail_url:
-        properties['Draft'] = {'url': draft_gmail_url}
+    # Only show categories that need attention
+    actionable = ['needs_reply', 'needs_action', 'delegate', 'waiting_for']
+    for cat in actionable:
+        items = [i for i in action_items if i['category'] == cat]
+        if not items:
+            continue
+        children.append(_notion_heading(f"{CATEGORIES[cat]} ({len(items)})", level=2))
+        for item in items:
+            urgency_tag = f"[{item['urgency'].upper()}]" if item['urgency'] == 'high' else f"[{item['urgency'].capitalize()}]"
+            line = f"{urgency_tag} {item['from']} — {item['subject']}"
+            children.append(_notion_paragraph(line))
+            children.append(_notion_paragraph(f"  ↳ {item['reason']}", italic=True))
+
+    if drafted_count > 0:
+        children.append(_notion_divider())
+        children.append(_notion_paragraph(
+            f"{drafted_count} draft(s) ready → https://mail.google.com/mail/u/0/#drafts"
+        ))
+
+    # Quiet summary at the bottom
+    quiet_total = sum(summary.get(k, 0) for k in ('read_later', 'newsletter', 'no_action'))
+    if quiet_total > 0:
+        children.append(_notion_divider())
+        parts = []
+        for k in ('read_later', 'newsletter', 'no_action'):
+            if summary.get(k, 0) > 0:
+                parts.append(f"{CATEGORIES[k]}: {summary[k]}")
+        children.append(_notion_paragraph(f"Skipped: {', '.join(parts)}"))
 
     response = requests.post(
         'https://api.notion.com/v1/pages',
@@ -209,10 +229,28 @@ def log_to_notion(token, database_id, email, category, reason, urgency, draft_gm
             'Content-Type': 'application/json',
             'Notion-Version': '2022-06-28',
         },
-        json={'parent': {'database_id': database_id}, 'properties': properties},
-        timeout=10,
+        json={
+            'parent': {'page_id': page_id},
+            'properties': {'title': {'title': [{'text': {'content': title}}]}},
+            'children': children[:100],  # Notion API limit
+        },
+        timeout=15,
     )
     return response.status_code == 200
+
+
+def _notion_heading(text, level=1):
+    key = f"heading_{level}"
+    return {key: {'rich_text': [{'text': {'content': text}}]}}
+
+
+def _notion_paragraph(text, italic=False):
+    annotations = {'italic': True} if italic else {}
+    return {'paragraph': {'rich_text': [{'text': {'content': text}, 'annotations': annotations}]}}
+
+
+def _notion_divider():
+    return {'divider': {}}
 
 
 def compute_cognitive_load(results):
@@ -220,35 +258,44 @@ def compute_cognitive_load(results):
     return min(10, raw)
 
 
-def send_notification(service, user_email, drafted_emails, summary, cognitive_score):
+def send_notification(service, user_email, action_items, summary, cognitive_score, drafted_count):
     load_label = 'Low' if cognitive_score <= 3 else 'Medium' if cognitive_score <= 6 else 'High'
 
     lines = [
         f"Cognitive Load: {cognitive_score}/10 ({load_label})",
         '',
-        'Triage Summary:',
     ]
-    for key, label in CATEGORIES.items():
-        count = summary.get(key, 0)
-        if count > 0:
-            lines.append(f"  {label}: {count}")
 
-    if drafted_emails:
-        lines += ['', '--- Drafts Ready ---']
-        for i, item in enumerate(drafted_emails, 1):
-            lines.append(f"{i}. From:    {item['from']}")
-            lines.append(f"   Subject: {item['subject']}")
+    # Only show what needs attention
+    for cat in ('needs_reply', 'needs_action', 'delegate', 'waiting_for'):
+        items = [i for i in action_items if i['category'] == cat]
+        if not items:
+            continue
+        lines.append(f"--- {CATEGORIES[cat]} ({len(items)}) ---")
+        for item in items:
+            tag = item['urgency'].upper() if item['urgency'] == 'high' else item['urgency'].capitalize()
+            lines.append(f"  [{tag}] {item['from']}")
+            lines.append(f"    {item['subject']}")
+            lines.append(f"    {item['reason']}")
             lines.append('')
-        lines.append('Review drafts: https://mail.google.com/mail/u/0/#drafts')
 
-    lines.append(f"\n---\nRun completed at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+    if drafted_count > 0:
+        lines.append(f'{drafted_count} draft(s) ready: https://mail.google.com/mail/u/0/#drafts')
+        lines.append('')
+
+    # Quiet counts
+    quiet = {k: summary.get(k, 0) for k in ('read_later', 'newsletter', 'no_action') if summary.get(k, 0) > 0}
+    if quiet:
+        lines.append('Skipped: ' + ', '.join(f"{CATEGORIES[k]}: {v}" for k, v in quiet.items()))
+
+    lines.append(f"\n---\n{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
 
     message = MIMEText('\n'.join(lines))
     message['To'] = user_email
     message['From'] = user_email
     message['Subject'] = (
         f"[AI Triage] Load {cognitive_score}/10 — "
-        f"{summary.get('needs_reply', 0)} draft(s), "
+        f"{drafted_count} draft(s), "
         f"{summary.get('needs_action', 0)} action(s)"
     )
 
@@ -262,8 +309,8 @@ def main():
         raise ValueError('ANTHROPIC_API_KEY environment variable is not set.')
 
     notion_token = os.environ.get('NOTION_API_KEY')
-    notion_db = os.environ.get('NOTION_DATABASE_ID')
-    use_notion = bool(notion_token and notion_db)
+    notion_page = os.environ.get('NOTION_PAGE_ID')
+    use_notion = bool(notion_token and notion_page)
 
     client = anthropic.Anthropic(api_key=api_key)
     service = get_gmail_service()
@@ -277,9 +324,9 @@ def main():
     print(f'Found {len(emails)} unread emails to triage')
 
     results = []
-    drafted_emails = []
+    action_items = []
+    drafted_count = 0
     summary = {k: 0 for k in CATEGORIES}
-    notion_failures = 0
 
     for email in emails:
         print(f"  Triaging: {email['subject'][:60]}")
@@ -288,36 +335,45 @@ def main():
         category = result.get('category', 'no_action')
         reason = result.get('reason', '')
         urgency = result.get('urgency', 'low')
-        draft_gmail_url = None
 
         if category == 'needs_reply' and result.get('draft_reply'):
-            draft_id = create_draft(service, email, result['draft_reply'])
-            draft_gmail_url = f"https://mail.google.com/mail/u/0/#drafts/{draft_id}"
-            drafted_emails.append({'from': email['from'], 'subject': email['subject']})
+            create_draft(service, email, result['draft_reply'])
+            drafted_count += 1
             print(f"    -> [{CATEGORIES[category]}] Draft created")
         else:
             print(f"    -> [{CATEGORIES[category]}] {reason}")
 
         mark_as_read(service, email['id'])
 
-        if use_notion:
-            ok = log_to_notion(notion_token, notion_db, email, category, reason, urgency, draft_gmail_url)
-            if not ok:
-                notion_failures += 1
+        # Track actionable items for the briefing
+        if category in ('needs_reply', 'needs_action', 'delegate', 'waiting_for'):
+            action_items.append({
+                'category': category,
+                'from': email['from'],
+                'subject': email['subject'],
+                'reason': reason,
+                'urgency': urgency,
+            })
 
         summary[category] += 1
         results.append({'category': category})
 
     cognitive_score = compute_cognitive_load(results)
 
-    if notion_failures:
-        print(f'Warning: {notion_failures} Notion log(s) failed.')
+    if use_notion and emails:
+        ok = push_briefing_to_notion(
+            notion_token, notion_page, action_items, summary, cognitive_score, drafted_count,
+        )
+        if ok:
+            print('Briefing pushed to Notion.')
+        else:
+            print('Warning: Failed to push briefing to Notion.')
 
     if emails:
-        send_notification(service, user_email, drafted_emails, summary, cognitive_score)
+        send_notification(service, user_email, action_items, summary, cognitive_score, drafted_count)
         print(
             f'\nDone. Cognitive load: {cognitive_score}/10. '
-            f'{len(drafted_emails)} draft(s) created. '
+            f'{drafted_count} draft(s) created. '
             f'Notification sent to {user_email}.'
         )
     else:
