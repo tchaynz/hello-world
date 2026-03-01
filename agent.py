@@ -16,14 +16,16 @@ SCOPES = [
     'https://www.googleapis.com/auth/gmail.send',
 ]
 
-# 7 triage categories with display labels
 CATEGORIES = {
     'needs_reply':   'Needs Reply',
     'needs_action':  'Needs Action',
     'waiting_for':   'Waiting For',
     'delegate':      'Delegate',
+    'important':     'New Important Emails',
     'read_later':    'Read Later',
     'newsletter':    'Newsletter',
+    'unimportant':   'Unimportant',
+    'spam':          'Potential Spam',
     'no_action':     'No Action',
 }
 
@@ -31,10 +33,13 @@ CATEGORIES = {
 COGNITIVE_WEIGHTS = {
     'needs_reply':  3,
     'needs_action': 2,
+    'important':    1,
     'delegate':     1,
     'waiting_for':  1,
     'read_later':   0,
     'newsletter':   0,
+    'unimportant':  0,
+    'spam':         0,
     'no_action':    0,
 }
 
@@ -117,9 +122,12 @@ Categories:
 - needs_action: Requires a task or decision from you, but no email reply needed
 - waiting_for:  You sent this or are CC'd — you're waiting on the other party
 - delegate:     Should be forwarded to or handled by someone else
-- read_later:   Worth reading for context but no action required
+- important:    Important email worth reading (bill, legal notice, account alert) but no immediate reply or action needed
+- read_later:   Worth reading for context or reference but not urgent
 - newsletter:   Subscribed newsletter, digest, or regular publication
-- no_action:    Automated notification, receipt, alert, spam, or bulk mail
+- unimportant:  Marketing, promotional, social media notification, or other low-value bulk mail
+- spam:         Unsolicited, suspicious, or likely spam
+- no_action:    Automated receipt, system notification, or confirmation requiring no attention
 
 Email details:
 - From: {email['from']}
@@ -133,7 +141,7 @@ Email details:
 
 Respond with a JSON object only — no extra text:
 {{
-  "category": "<one of the 7 categories>",
+  "category": "<one of the 10 categories>",
   "reason": "one concise sentence",
   "urgency": "high|medium|low",
   "draft_reply": "full draft reply if category is needs_reply, otherwise null"
@@ -182,45 +190,94 @@ def create_draft(service, email, draft_text):
     return draft['id']
 
 
-def push_briefing_to_notion(token, page_id, action_items, summary, cognitive_score, drafted_count):
-    """Create a single briefing page under a Notion parent page."""
+def push_briefing_to_notion(token, page_id, all_emails, summary, cognitive_score, drafted_count):
+    """Create a briefing page under a Notion parent page."""
     load_label = 'Low' if cognitive_score <= 3 else 'Medium' if cognitive_score <= 6 else 'High'
     now = datetime.now(timezone.utc)
     title = f"Email Briefing — {now.strftime('%b %-d, %Y %H:%M UTC')}"
+    total = len(all_emails)
 
-    # Build page content blocks
-    children = [
-        _notion_heading(f"Cognitive Load: {cognitive_score}/10 ({load_label})"),
-    ]
+    children = []
 
-    # Only show categories that need attention
-    actionable = ['needs_reply', 'needs_action', 'delegate', 'waiting_for']
-    for cat in actionable:
-        items = [i for i in action_items if i['category'] == cat]
-        if not items:
-            continue
-        children.append(_notion_heading(f"{CATEGORIES[cat]} ({len(items)})", level=2))
-        for item in items:
-            urgency_tag = f"[{item['urgency'].upper()}]" if item['urgency'] == 'high' else f"[{item['urgency'].capitalize()}]"
-            line = f"{urgency_tag} {item['from']} — {item['subject']}"
-            children.append(_notion_paragraph(line))
-            children.append(_notion_paragraph(f"  ↳ {item['reason']}", italic=True))
-
+    # Executive Summary
+    children.append(_notion_heading("Executive Summary"))
+    stats = f"{total} email{'s' if total != 1 else ''} processed  •  Cognitive Load: {cognitive_score}/10 ({load_label})"
     if drafted_count > 0:
-        children.append(_notion_divider())
-        children.append(_notion_paragraph(
-            f"{drafted_count} draft(s) ready → https://mail.google.com/mail/u/0/#drafts"
-        ))
+        stats += f"  •  {drafted_count} draft(s) created → https://mail.google.com/mail/u/0/#drafts"
+    children.append(_notion_paragraph(stats))
 
-    # Quiet summary at the bottom
-    quiet_total = sum(summary.get(k, 0) for k in ('read_later', 'newsletter', 'no_action'))
-    if quiet_total > 0:
+    breakdown = " | ".join(
+        f"{CATEGORIES[k]}: {v}" for k, v in summary.items() if v > 0
+    )
+    if breakdown:
+        children.append(_notion_paragraph(breakdown))
+    children.append(_notion_divider())
+
+    # Action Required
+    actionable_cats = ['needs_reply', 'needs_action', 'delegate', 'waiting_for']
+    actionable = [e for e in all_emails if e['category'] in actionable_cats]
+    if actionable:
+        children.append(_notion_heading("Action Required", level=2))
+        for cat in actionable_cats:
+            items = [e for e in actionable if e['category'] == cat]
+            if not items:
+                continue
+            children.append(_notion_heading(f"{CATEGORIES[cat]} ({len(items)})", level=3))
+            for item in items:
+                tag = f"[{item['urgency'].upper()}]" if item['urgency'] == 'high' else f"[{item['urgency'].capitalize()}]"
+                children.append(_notion_paragraph(f"{tag} {item['from']} — {item['subject']}"))
+                children.append(_notion_paragraph(f"  ↳ {item['reason']}", italic=True))
+                if item.get('body'):
+                    children.append(_notion_paragraph(item['body'][:400], italic=True))
         children.append(_notion_divider())
-        parts = []
-        for k in ('read_later', 'newsletter', 'no_action'):
-            if summary.get(k, 0) > 0:
-                parts.append(f"{CATEGORIES[k]}: {summary[k]}")
-        children.append(_notion_paragraph(f"Skipped: {', '.join(parts)}"))
+
+    # New Important Emails
+    important = [e for e in all_emails if e['category'] == 'important']
+    if important:
+        children.append(_notion_heading(f"New Important Emails ({len(important)})", level=2))
+        for item in important:
+            children.append(_notion_paragraph(f"{item['from']} — {item['subject']}"))
+            children.append(_notion_paragraph(f"  ↳ {item['reason']}", italic=True))
+            if item.get('body'):
+                children.append(_notion_paragraph(item['body'][:400], italic=True))
+        children.append(_notion_divider())
+
+    # Read Later
+    read_later = [e for e in all_emails if e['category'] == 'read_later']
+    if read_later:
+        children.append(_notion_heading(f"Read Later ({len(read_later)})", level=2))
+        for item in read_later:
+            children.append(_notion_paragraph(f"{item['from']} — {item['subject']}"))
+            children.append(_notion_paragraph(f"  ↳ {item['reason']}", italic=True))
+            if item.get('body'):
+                children.append(_notion_paragraph(item['body'][:300], italic=True))
+        children.append(_notion_divider())
+
+    # Unimportant Emails (newsletter + unimportant)
+    unimportant = [e for e in all_emails if e['category'] in ('newsletter', 'unimportant')]
+    if unimportant:
+        children.append(_notion_heading(f"Unimportant Emails ({len(unimportant)})", level=2))
+        for item in unimportant:
+            children.append(_notion_paragraph(f"{item['from']} — {item['subject']}"))
+            children.append(_notion_paragraph(f"  ↳ {item['reason']}", italic=True))
+        children.append(_notion_divider())
+
+    # Potential Spam
+    spam = [e for e in all_emails if e['category'] == 'spam']
+    if spam:
+        children.append(_notion_heading(f"Potential Spam ({len(spam)})", level=2))
+        for item in spam:
+            children.append(_notion_paragraph(f"{item['from']} — {item['subject']}"))
+            children.append(_notion_paragraph(f"  ↳ {item['reason']}", italic=True))
+        children.append(_notion_divider())
+
+    # No Action
+    no_action = [e for e in all_emails if e['category'] == 'no_action']
+    if no_action:
+        children.append(_notion_heading(f"No Action ({len(no_action)})", level=2))
+        for item in no_action:
+            children.append(_notion_paragraph(f"{item['from']} — {item['subject']}"))
+            children.append(_notion_paragraph(f"  ↳ {item['reason']}", italic=True))
 
     response = requests.post(
         'https://api.notion.com/v1/pages',
@@ -276,8 +333,7 @@ def main():
     emails = get_recent_emails(service, hours=hours)
     print(f'Found {len(emails)} unread emails to triage')
 
-    results = []
-    action_items = []
+    all_emails = []
     drafted_count = 0
     summary = {k: 0 for k in CATEGORIES}
 
@@ -298,24 +354,22 @@ def main():
 
         mark_as_read(service, email['id'])
 
-        # Track actionable items for the briefing
-        if category in ('needs_reply', 'needs_action', 'delegate', 'waiting_for'):
-            action_items.append({
-                'category': category,
-                'from': email['from'],
-                'subject': email['subject'],
-                'reason': reason,
-                'urgency': urgency,
-            })
+        all_emails.append({
+            'category': category,
+            'from': email['from'],
+            'subject': email['subject'],
+            'reason': reason,
+            'urgency': urgency,
+            'body': email['body'][:400],
+        })
 
         summary[category] += 1
-        results.append({'category': category})
 
-    cognitive_score = compute_cognitive_load(results)
+    cognitive_score = compute_cognitive_load(all_emails)
 
     if use_notion and emails:
         ok = push_briefing_to_notion(
-            notion_token, notion_page, action_items, summary, cognitive_score, drafted_count,
+            notion_token, notion_page, all_emails, summary, cognitive_score, drafted_count,
         )
         if ok:
             print('Briefing pushed to Notion.')
