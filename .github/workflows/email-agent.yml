@@ -1,17 +1,19 @@
-name: AI Email Assistant
+name: AI Email Triage
 
 on:
   schedule:
-    # Runs every hour — adjust cron to change frequency
-    # Examples:
-    #   Every 30 min:  '*/30 * * * *'
-    #   Every 2 hours: '0 */2 * * *'
-    #   Twice a day:   '0 9,17 * * *'
-    - cron: '0 * * * *'
+    # Runs 3x daily — times below are UTC. Adjust to match your timezone.
+    # Examples for US Eastern (ET = UTC-5 in winter, UTC-4 in summer):
+    #   7 AM ET  -> 12:00 UTC
+    #   12 PM ET -> 17:00 UTC
+    #   6 PM ET  -> 23:00 UTC
+    - cron: '0 12 * * *'
+    - cron: '0 17 * * *'
+    - cron: '0 23 * * *'
   workflow_dispatch:  # Allows manual trigger from GitHub Actions tab
 
 jobs:
-  check-emails:
+  triage-emails:
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -28,9 +30,13 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run email agent
+      - name: Run email triage agent
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GMAIL_TOKEN_JSON: ${{ secrets.GMAIL_TOKEN_JSON }}
-          CHECK_HOURS: '1'
+          NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
+          NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+          # CHECK_HOURS covers the window since the last run.
+          # With 3x daily (~8h apart), 8 hours with slight overlap is safe.
+          CHECK_HOURS: '8'
         run: python agent.py

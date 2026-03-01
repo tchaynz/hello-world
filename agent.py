@@ -1,7 +1,10 @@
 import os
+import re
 import base64
 import json
+import requests
 from email.mime.text import MIMEText
+from email.utils import parsedate_to_datetime
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
@@ -9,10 +12,32 @@ import anthropic
 from datetime import datetime, timezone, timedelta
 
 SCOPES = [
-    'https://www.googleapis.com/auth/gmail.readonly',
+    'https://www.googleapis.com/auth/gmail.modify',
     'https://www.googleapis.com/auth/gmail.compose',
     'https://www.googleapis.com/auth/gmail.send',
 ]
+
+# 7 triage categories with display labels
+CATEGORIES = {
+    'needs_reply':   'Needs Reply',
+    'needs_action':  'Needs Action',
+    'waiting_for':   'Waiting For',
+    'delegate':      'Delegate',
+    'read_later':    'Read Later',
+    'newsletter':    'Newsletter',
+    'no_action':     'No Action',
+}
+
+# Points toward cognitive load score (0-10)
+COGNITIVE_WEIGHTS = {
+    'needs_reply':  3,
+    'needs_action': 2,
+    'delegate':     1,
+    'waiting_for':  1,
+    'read_later':   0,
+    'newsletter':   0,
+    'no_action':    0,
+}
 
 
 def get_gmail_service():
@@ -57,11 +82,11 @@ def extract_body(payload):
     return ''
 
 
-def get_recent_emails(service, hours=1):
+def get_recent_emails(service, hours=8):
     after = int((datetime.now(timezone.utc) - timedelta(hours=hours)).timestamp())
     query = f'is:unread after:{after} -category:promotions -category:social -category:updates'
 
-    results = service.users().messages().list(userId='me', q=query, maxResults=25).execute()
+    results = service.users().messages().list(userId='me', q=query, maxResults=50).execute()
     messages = results.get('messages', [])
 
     emails = []
@@ -85,44 +110,35 @@ def get_recent_emails(service, hours=1):
     return emails
 
 
-def classify_and_draft(client, email):
-    prompt = f"""You are an email assistant. Analyze this email and determine if it is an important
-email that requires a personal reply from the recipient.
+def triage_email(client, email):
+    prompt = f"""You are an expert email triage assistant. Classify this email into exactly one category.
+
+Categories:
+- needs_reply:  A real person sent this directly and expects a personal reply
+- needs_action: Requires a task or decision from you, but no email reply needed
+- waiting_for:  You sent this or are CC'd — you're waiting on the other party
+- delegate:     Should be forwarded to or handled by someone else
+- read_later:   Worth reading for context but no action required
+- newsletter:   Subscribed newsletter, digest, or regular publication
+- no_action:    Automated notification, receipt, alert, spam, or bulk mail
 
 Email details:
 - From: {email['from']}
 - Subject: {email['subject']}
 - Date: {email['date']}
-- List-Unsubscribe header: {email['list_unsubscribe'] or 'None'}
-- List-ID header: {email['list_id'] or 'None'}
-- Precedence header: {email['precedence'] or 'None'}
+- List-Unsubscribe: {email['list_unsubscribe'] or 'None'}
+- List-ID: {email['list_id'] or 'None'}
+- Precedence: {email['precedence'] or 'None'}
 - Body:
 {email['body']}
 
-Classify this email and respond with a JSON object only — no extra text:
+Respond with a JSON object only — no extra text:
 {{
-  "needs_reply": true or false,
-  "reason": "brief explanation",
-  "draft_reply": "full draft reply text if needs_reply is true, otherwise null"
-}}
-
-Mark needs_reply as FALSE for:
-- Newsletters, digests, subscription emails
-- Marketing or promotional content
-- Automated notifications (receipts, order updates, shipping, bank alerts)
-- Social media notifications
-- Emails with List-Unsubscribe, List-ID, or Precedence: bulk headers
-- Senders containing "noreply", "no-reply", "donotreply", "notifications", "alerts"
-- Spam or unsolicited bulk email
-
-Mark needs_reply as TRUE for:
-- Direct personal email from a real person to the recipient
-- A colleague, client, or partner asking a question or waiting on something
-- Meeting requests or scheduling emails that need confirmation
-- Business emails requiring a decision or action
-
-If needs_reply is true, write a professional, helpful draft reply in first person.
-Keep it concise and natural — leave placeholders like [NAME] only where truly needed."""
+  "category": "<one of the 7 categories>",
+  "reason": "one concise sentence",
+  "urgency": "high|medium|low",
+  "draft_reply": "full draft reply if category is needs_reply, otherwise null"
+}}"""
 
     response = client.messages.create(
         model='claude-opus-4-6',
@@ -131,9 +147,23 @@ Keep it concise and natural — leave placeholders like [NAME] only where truly 
     )
 
     try:
-        return json.loads(response.content[0].text)
-    except json.JSONDecodeError:
-        return {'needs_reply': False, 'reason': 'Could not parse response', 'draft_reply': None}
+        raw = response.content[0].text.strip()
+        raw = re.sub(r'^```(?:json)?\s*', '', raw)
+        raw = re.sub(r'\s*```$', '', raw)
+        result = json.loads(raw)
+        if result.get('category') not in CATEGORIES:
+            result['category'] = 'no_action'
+        return result
+    except (json.JSONDecodeError, IndexError):
+        return {'category': 'no_action', 'reason': 'Could not parse response', 'urgency': 'low', 'draft_reply': None}
+
+
+def mark_as_read(service, email_id):
+    service.users().messages().modify(
+        userId='me',
+        id=email_id,
+        body={'removeLabelIds': ['UNREAD']},
+    ).execute()
 
 
 def create_draft(service, email, draft_text):
@@ -153,24 +183,74 @@ def create_draft(service, email, draft_text):
     return draft['id']
 
 
-def send_notification(service, user_email, drafted_emails):
-    lines = []
-    for i, item in enumerate(drafted_emails, 1):
-        lines.append(f"{i}. From:    {item['from']}")
-        lines.append(f"   Subject: {item['subject']}")
-        lines.append('')
+def log_to_notion(token, database_id, email, category, reason, urgency, draft_gmail_url=None):
+    try:
+        dt = parsedate_to_datetime(email['date'])
+        date_iso = dt.astimezone(timezone.utc).isoformat()
+    except Exception:
+        date_iso = datetime.now(timezone.utc).isoformat()
 
-    body = (
-        f"Your AI email assistant created {len(drafted_emails)} draft reply(s) for your review.\n\n"
-        + '\n'.join(lines)
-        + "Review and send your drafts here:\nhttps://mail.google.com/mail/u/0/#drafts\n\n"
-        + f"---\nRun completed at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+    properties = {
+        'Subject':  {'title':     [{'text': {'content': email['subject'][:2000]}}]},
+        'From':     {'rich_text': [{'text': {'content': email['from'][:2000]}}]},
+        'Category': {'select':    {'name': CATEGORIES[category]}},
+        'Urgency':  {'select':    {'name': urgency.capitalize()}},
+        'Reason':   {'rich_text': [{'text': {'content': reason[:2000]}}]},
+        'Received': {'date':      {'start': date_iso}},
+    }
+
+    if draft_gmail_url:
+        properties['Draft'] = {'url': draft_gmail_url}
+
+    response = requests.post(
+        'https://api.notion.com/v1/pages',
+        headers={
+            'Authorization': f'Bearer {token}',
+            'Content-Type': 'application/json',
+            'Notion-Version': '2022-06-28',
+        },
+        json={'parent': {'database_id': database_id}, 'properties': properties},
+        timeout=10,
     )
+    return response.status_code == 200
 
-    message = MIMEText(body)
+
+def compute_cognitive_load(results):
+    raw = sum(COGNITIVE_WEIGHTS.get(r['category'], 0) for r in results)
+    return min(10, raw)
+
+
+def send_notification(service, user_email, drafted_emails, summary, cognitive_score):
+    load_label = 'Low' if cognitive_score <= 3 else 'Medium' if cognitive_score <= 6 else 'High'
+
+    lines = [
+        f"Cognitive Load: {cognitive_score}/10 ({load_label})",
+        '',
+        'Triage Summary:',
+    ]
+    for key, label in CATEGORIES.items():
+        count = summary.get(key, 0)
+        if count > 0:
+            lines.append(f"  {label}: {count}")
+
+    if drafted_emails:
+        lines += ['', '--- Drafts Ready ---']
+        for i, item in enumerate(drafted_emails, 1):
+            lines.append(f"{i}. From:    {item['from']}")
+            lines.append(f"   Subject: {item['subject']}")
+            lines.append('')
+        lines.append('Review drafts: https://mail.google.com/mail/u/0/#drafts')
+
+    lines.append(f"\n---\nRun completed at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+
+    message = MIMEText('\n'.join(lines))
     message['To'] = user_email
     message['From'] = user_email
-    message['Subject'] = f"[AI Assistant] {len(drafted_emails)} draft reply(s) ready"
+    message['Subject'] = (
+        f"[AI Triage] Load {cognitive_score}/10 — "
+        f"{summary.get('needs_reply', 0)} draft(s), "
+        f"{summary.get('needs_action', 0)} action(s)"
+    )
 
     raw = base64.urlsafe_b64encode(message.as_bytes()).decode('utf-8')
     service.users().messages().send(userId='me', body={'raw': raw}).execute()
@@ -181,6 +261,10 @@ def main():
     if not api_key:
         raise ValueError('ANTHROPIC_API_KEY environment variable is not set.')
 
+    notion_token = os.environ.get('NOTION_API_KEY')
+    notion_db = os.environ.get('NOTION_DATABASE_ID')
+    use_notion = bool(notion_token and notion_db)
+
     client = anthropic.Anthropic(api_key=api_key)
     service = get_gmail_service()
 
@@ -188,32 +272,56 @@ def main():
     user_email = profile['emailAddress']
     print(f'Checking emails for {user_email}...')
 
-    hours = int(os.environ.get('CHECK_HOURS', '1'))
+    hours = int(os.environ.get('CHECK_HOURS', '8'))
     emails = get_recent_emails(service, hours=hours)
-    print(f'Found {len(emails)} unread emails to analyse')
+    print(f'Found {len(emails)} unread emails to triage')
 
+    results = []
     drafted_emails = []
+    summary = {k: 0 for k in CATEGORIES}
+    notion_failures = 0
 
     for email in emails:
-        print(f"  Analysing: {email['subject'][:60]}")
-        result = classify_and_draft(client, email)
+        print(f"  Triaging: {email['subject'][:60]}")
+        result = triage_email(client, email)
 
-        if result.get('needs_reply') and result.get('draft_reply'):
+        category = result.get('category', 'no_action')
+        reason = result.get('reason', '')
+        urgency = result.get('urgency', 'low')
+        draft_gmail_url = None
+
+        if category == 'needs_reply' and result.get('draft_reply'):
             draft_id = create_draft(service, email, result['draft_reply'])
-            drafted_emails.append({
-                'from': email['from'],
-                'subject': email['subject'],
-                'draft_id': draft_id,
-            })
-            print(f"    -> Draft created")
+            draft_gmail_url = f"https://mail.google.com/mail/u/0/#drafts/{draft_id}"
+            drafted_emails.append({'from': email['from'], 'subject': email['subject']})
+            print(f"    -> [{CATEGORIES[category]}] Draft created")
         else:
-            print(f"    -> Skipped ({result.get('reason', 'no reply needed')})")
+            print(f"    -> [{CATEGORIES[category]}] {reason}")
 
-    if drafted_emails:
-        send_notification(service, user_email, drafted_emails)
-        print(f'\nDone. {len(drafted_emails)} draft(s) created. Notification sent to {user_email}.')
+        mark_as_read(service, email['id'])
+
+        if use_notion:
+            ok = log_to_notion(notion_token, notion_db, email, category, reason, urgency, draft_gmail_url)
+            if not ok:
+                notion_failures += 1
+
+        summary[category] += 1
+        results.append({'category': category})
+
+    cognitive_score = compute_cognitive_load(results)
+
+    if notion_failures:
+        print(f'Warning: {notion_failures} Notion log(s) failed.')
+
+    if emails:
+        send_notification(service, user_email, drafted_emails, summary, cognitive_score)
+        print(
+            f'\nDone. Cognitive load: {cognitive_score}/10. '
+            f'{len(drafted_emails)} draft(s) created. '
+            f'Notification sent to {user_email}.'
+        )
     else:
-        print('\nDone. No drafts needed this run.')
+        print('\nDone. No new emails this run.')
 
 
 if __name__ == '__main__':

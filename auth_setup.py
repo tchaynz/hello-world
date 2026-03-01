@@ -7,6 +7,9 @@ Steps:
 2. Run: python auth_setup.py
 3. Copy the printed token JSON and add it as GMAIL_TOKEN_JSON in GitHub Secrets
 
+NOTE: If you previously ran this script, run it again — the gmail.modify scope
+was added so the agent can mark emails as read.
+
 Requirements: pip install google-auth-oauthlib
 """
 
@@ -14,7 +17,7 @@ import json
 from google_auth_oauthlib.flow import InstalledAppFlow
 
 SCOPES = [
-    'https://www.googleapis.com/auth/gmail.readonly',
+    'https://www.googleapis.com/auth/gmail.modify',
     'https://www.googleapis.com/auth/gmail.compose',
     'https://www.googleapis.com/auth/gmail.send',
 ]
